@@ -1,0 +1,23 @@
+{
+  "name": "session-aware-equity-collateral",
+  "version": "1.0.0",
+  "description": "Session-aware equity collateral oracle — continuous 24/7 mark price for tokenized equities with EMA off-hours, transition smoothing, and variance guard. Built on SEDA.",
+  "type": "module",
+  "scripts": {
+    "build": "make build",
+    "deploy": "bun run build && bunx seda-sdk oracle-program upload ./target/wasm32-wasip1/release-wasm/session-aware-equity-collateral.wasm",
+    "test": "bun test tests/ src/"
+  },
+  "keywords": ["seda", "oracle", "equity", "collateral", "session", "ema", "rwa", "lending", "wasm"],
+  "license": "MIT",
+  "devDependencies": {
+    "@seda-protocol/dev-tools": "^1.0.3",
+    "@types/bun": "^1.2.22",
+    "bignumber.js": "^9.3.1",
+    "binaryen": "^124.0.0",
+    "wabt": "^1.0.37"
+  },
+  "dependencies": {
+    "@seda-protocol/vm": "^1.1.0"
+  }
+}

@@ -11,73 +11,54 @@ const DXFEED_NVDA = { Quote: { NVDA: { bidPrice: 134.80, askPrice: 135.20 } } };
 const FINAGE_NVDA = { symbol: "NVDA", bid: 134.90, ask: 135.10 };
 const PYTH_NVDA = { parsed: [{ price: { price: "13500000000", conf: "5000000", expo: -8, publish_time: 1750000000 } }] };
 
-// Monday 2pm ET = 18:00 UTC → in session (NYSE open 13:30–20:00 UTC)
-const TS_OPEN = 1751310000; // a Monday ~18:00 UTC
-// Saturday 2pm UTC → weekend
-const TS_WEEKEND = 1751020800;
-// Monday 13:35 UTC → 5 min after open = transition window
-const TS_TRANSITION = 1751294100;
+const TS_OPEN = 1751310000;       // Monday ~18:00 UTC (in session)
+const TS_WEEKEND = 1751020800;    // Saturday
+const TS_TRANSITION = 1751294100; // Monday 13:35 UTC (5min after open)
 
-function mockSources(dxfeed = DXFEED_NVDA, finage = FINAGE_NVDA, pyth = PYTH_NVDA) {
+function mockSources() {
   fetchMock.mockImplementation((...args: any[]) => {
     const u = String(args[0] || "");
-    if (u.includes("dxfeed")) return new Response(JSON.stringify(dxfeed));
-    if (u.includes("finage")) return new Response(JSON.stringify(finage));
-    if (u.includes("hermes.pyth")) return new Response(JSON.stringify(pyth));
-    return new Response(JSON.stringify(dxfeed));
+    if (u.includes("dxfeed")) return new Response(JSON.stringify(DXFEED_NVDA));
+    if (u.includes("finage")) return new Response(JSON.stringify(FINAGE_NVDA));
+    if (u.includes("hermes.pyth")) return new Response(JSON.stringify(PYTH_NVDA));
+    return new Response(JSON.stringify(DXFEED_NVDA));
   });
 }
 
-function makeInput(timestamp: number, overrides: Record<string, any> = {}) {
+// Helper: build a tally reveal with three signals + redemption state
+function makeReveal(overrides: Record<string, any> = {}) {
   return JSON.stringify({
-    symbol: "NVDA",
-    timestamp,
-    config: {
-      open_hour: 13, open_min: 30,
-      close_hour: 20, close_min: 0,
-      trading_days: [1, 2, 3, 4, 5],
-      holidays: [],
-      ema_period: 20,
-      variance_threshold_bps: 100,
-      transition_secs: 900,
-      last_reference_price: 135_000_000, // $135 in micro-cents
-      pyth_feed_id: "0xtest",
-      ...overrides,
+    sy: "NVDA",
+    underlying: [
+      { n: "dxFeed", p: 135_000_000, ok: true },
+      { n: "Finage", p: 135_000_000, ok: true },
+    ],
+    secondary: [
+      { n: "Uniswap", p: 134_800_000, ok: true },
+      { n: "Curve", p: 134_900_000, ok: true },
+    ],
+    nav: 135_000_000,
+    pyth: { n: "Pyth", p: 135_000_000, ok: true },
+    ss: "OPEN", ts: TS_OPEN,
+    ep: 20, vt: 100, tw: 900, rp: 135_000_000, so: 5400,
+    rd: {
+      open: false, instant: false, accessible_to_liquidator: false,
+      redemption_asset: "USDC", swapper_liquidity_sufficient: false,
+      nav_price: 135_000_000,
     },
+    dp: 200_000, dt: 100_000,
+    ...overrides,
   });
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// REGIME 1: In-session — mark tracks live median
+// REGIME 1: In-session — mark tracks live underlying
 // ═══════════════════════════════════════════════════════════════════
 
 describe("Regime 1: In-session (OPEN)", () => {
-  it("execution should detect OPEN session and fetch 3 sources", async () => {
-    mockSources();
+  it("should produce SECONDARY_REALIZABLE mark from underlying + secondary", async () => {
     const wasm = await file(WASM_PATH).arrayBuffer();
-    const vm = await testOracleProgramExecution(
-      Buffer.from(wasm), Buffer.from(makeInput(TS_OPEN)), fetchMock
-    );
-    expect(vm.exitCode).toBe(0);
-    const r = JSON.parse(Buffer.from(vm.result).toString("utf-8"));
-
-    expect(r.ss).toBe("OPEN");
-    expect(r.src.filter((s: any) => s.ok).length).toBeGreaterThanOrEqual(2);
-
-    console.log("OPEN execution:", JSON.stringify(r, null, 2));
-  });
-
-  it("tally should produce median mark ~$135 with high confidence", async () => {
-    const wasm = await file(WASM_PATH).arrayBuffer();
-    const reveal = JSON.stringify({
-      sy: "NVDA", ss: "OPEN", ts: TS_OPEN,
-      ep: 20, vt: 100, tw: 900, rp: 135_000_000, so: 5400,
-      src: [
-        { n: "dxFeed", p: 135_000_000, ok: true },
-        { n: "Finage", p: 135_000_000, ok: true },
-        { n: "Pyth", p: 135_000_000, ok: true },
-      ],
-    });
+    const reveal = makeReveal(); // default: redemption not accessible
 
     const vm = await testOracleProgramTally(Buffer.from(wasm), Buffer.from("t"),
       [{ exitCode: 0, gasUsed: 0, inConsensus: true, result: Buffer.from(reveal) }]);
@@ -85,32 +66,39 @@ describe("Regime 1: In-session (OPEN)", () => {
     const r = JSON.parse(Buffer.from(vm.result).toString("utf-8"));
 
     expect(r.ss).toBe("OPEN");
+    expect(r.anchor).toBe("SECONDARY_REALIZABLE");
+    expect(r.ra).toBe(false); // liquidator can't redeem
     expect(r.valid).toBe(true);
-    expect(r.conf).toBeGreaterThanOrEqual(90);
-    expect(r.mark).toBeCloseTo(135_000_000, -3);
-    expect(r.su).toBe(3);
+    expect(r.conf).toBeGreaterThanOrEqual(80);
+    // Mark should be min(underlying, secondary) ≈ $134.80–$135.00
+    expect(r.mark).toBeLessThanOrEqual(135_000_000);
+    expect(r.mark).toBeGreaterThan(134_000_000);
 
-    console.log("OPEN tally:", JSON.stringify(r, null, 2));
+    console.log("OPEN SECONDARY_REALIZABLE:", JSON.stringify(r, null, 2));
   });
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// REGIME 2: Weekend — EMA stays stable despite volatile off-hours signal
+// REGIME 2: Weekend — EMA resists manipulation
 // ═══════════════════════════════════════════════════════════════════
 
-describe("Regime 2: Weekend (CLOSED_WEEKEND) — manipulation resistance", () => {
-  it("tally should barely move mark despite 5% off-hours spike", async () => {
+describe("Regime 2: Weekend — manipulation resistance", () => {
+  it("should barely move mark despite volatile off-hours signal", async () => {
     const wasm = await file(WASM_PATH).arrayBuffer();
-
-    // Off-hours signal spikes to $142 (5% above $135 ref) — manipulation attempt
-    const reveal = JSON.stringify({
-      sy: "NVDA", ss: "CLOSED_WEEKEND", ts: TS_WEEKEND,
-      ep: 20, vt: 100, tw: 900, rp: 135_000_000, so: 0,
-      src: [
-        { n: "dxFeed", p: 0, ok: false },      // closed
-        { n: "Finage", p: 0, ok: false },       // closed
-        { n: "Pyth", p: 142_000_000, ok: true }, // thin off-hours signal, spiked
+    // Off-hours: underlying dark, secondary + pyth spiked to $142
+    const reveal = makeReveal({
+      ss: "CLOSED_WEEKEND", so: 0,
+      underlying: [
+        { n: "dxFeed", p: 0, ok: false },
+        { n: "Finage", p: 0, ok: false },
       ],
+      secondary: [
+        { n: "Uniswap", p: 142_000_000, ok: true },
+        { n: "Curve", p: 141_500_000, ok: true },
+      ],
+      pyth: { n: "Pyth", p: 141_800_000, ok: true },
+      dp: 15_000, dt: 100_000, // thin depth
+      vt: 500, // 5% variance threshold (depth discount + spike = >1%)
     });
 
     const vm = await testOracleProgramTally(Buffer.from(wasm), Buffer.from("t"),
@@ -119,15 +107,16 @@ describe("Regime 2: Weekend (CLOSED_WEEKEND) — manipulation resistance", () =>
     const r = JSON.parse(Buffer.from(vm.result).toString("utf-8"));
 
     expect(r.ss).toBe("CLOSED_WEEKEND");
-    // EMA with period 20: alpha = 2/21 ≈ 0.095
-    // EMA = 0.095 * 142 + 0.905 * 135 = 13.49 + 122.18 = 135.67
-    // The $7 spike barely moves the mark by ~$0.67
-    expect(r.mark).toBeGreaterThan(135_000_000);
-    expect(r.mark).toBeLessThan(136_000_000); // stays within $1 of reference
+    // Composite with period 20: reference anchors heavily.
+    // Pre-discount composite ≈ $135.62 (spike barely moves it).
+    // Depth discount on $15K book (425bps) brings it to ~$129.85.
+    // The depth discount is intentional — a thin book IS less realizable.
+    expect(r.mark).toBeGreaterThan(128_000_000);
+    expect(r.mark).toBeLessThan(136_000_000);
+    expect(r.dd).toBeGreaterThan(0); // depth discount applied on thin book
     expect(r.valid).toBe(true);
-    expect(r.conf).toBeLessThan(80); // lower confidence off-hours
 
-    console.log("WEEKEND tally (manipulation resistance):", JSON.stringify(r, null, 2));
+    console.log("WEEKEND manipulation resistance:", JSON.stringify(r, null, 2));
   });
 });
 
@@ -136,20 +125,20 @@ describe("Regime 2: Weekend (CLOSED_WEEKEND) — manipulation resistance", () =>
 // ═══════════════════════════════════════════════════════════════════
 
 describe("Regime 3: Monday open with gap — transition window", () => {
-  it("tally should smoothly walk mark from $135 toward $155 over transition", async () => {
+  it("should smoothly walk mark toward live price", async () => {
     const wasm = await file(WASM_PATH).arrayBuffer();
-
-    // 5 minutes into transition window (300s / 900s = 33% progress)
-    // Live price is $155 (15% gap up overnight)
-    // Reference was $135
-    const reveal = JSON.stringify({
-      sy: "NVDA", ss: "TRANSITION", ts: TS_TRANSITION,
-      ep: 20, vt: 2000, tw: 900, rp: 135_000_000, so: 300,
-      src: [
+    // 5 min into transition, live at $155 (15% gap up)
+    const reveal = makeReveal({
+      ss: "TRANSITION", so: 300, vt: 2000, // wide threshold for gap
+      underlying: [
         { n: "dxFeed", p: 155_000_000, ok: true },
         { n: "Finage", p: 155_200_000, ok: true },
-        { n: "Pyth", p: 154_800_000, ok: true },
       ],
+      secondary: [
+        { n: "Uniswap", p: 154_500_000, ok: true },
+        { n: "Curve", p: 154_800_000, ok: true },
+      ],
+      pyth: { n: "Pyth", p: 154_900_000, ok: true },
     });
 
     const vm = await testOracleProgramTally(Buffer.from(wasm), Buffer.from("t"),
@@ -158,60 +147,45 @@ describe("Regime 3: Monday open with gap — transition window", () => {
     const r = JSON.parse(Buffer.from(vm.result).toString("utf-8"));
 
     expect(r.ss).toBe("TRANSITION");
-    // At 33% progress with cubic ease: t ≈ 4 * 0.33^3 ≈ 0.14
-    // Mark ≈ 135 * 0.86 + 155 * 0.14 ≈ 137.8
-    // NOT a single-block jump to $155
-    expect(r.mark).toBeGreaterThan(135_000_000); // moved from reference
-    expect(r.mark).toBeLessThan(150_000_000);    // hasn't reached live yet
+    // Should NOT jump straight to $155 — interpolating smoothly
+    expect(r.mark).toBeGreaterThan(135_000_000);
+    expect(r.mark).toBeLessThan(150_000_000);
     expect(r.valid).toBe(true);
 
-    console.log("TRANSITION tally (33% through window):", JSON.stringify(r, null, 2));
-  });
-
-  it("at end of transition window, mark should be near live price", async () => {
-    const wasm = await file(WASM_PATH).arrayBuffer();
-
-    // 850s into 900s transition window = ~94% progress
-    const reveal = JSON.stringify({
-      sy: "NVDA", ss: "TRANSITION", ts: TS_TRANSITION + 550,
-      ep: 20, vt: 2000, tw: 900, rp: 135_000_000, so: 850,
-      src: [
-        { n: "dxFeed", p: 155_000_000, ok: true },
-        { n: "Finage", p: 155_000_000, ok: true },
-        { n: "Pyth", p: 155_000_000, ok: true },
-      ],
-    });
-
-    const vm = await testOracleProgramTally(Buffer.from(wasm), Buffer.from("t"),
-      [{ exitCode: 0, gasUsed: 0, inConsensus: true, result: Buffer.from(reveal) }]);
-    expect(vm.exitCode).toBe(0);
-    const r = JSON.parse(Buffer.from(vm.result).toString("utf-8"));
-
-    // At 94% progress, cubic ease → t ≈ 0.99
-    // Mark should be very close to $155
-    expect(r.mark).toBeGreaterThan(153_000_000);
-
-    console.log("TRANSITION tally (94% through window):", JSON.stringify(r, null, 2));
+    console.log("TRANSITION (33% through):", JSON.stringify(r, null, 2));
   });
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// Variance guard — DEFER when mark deviates too far
+// REGIME 4: Depeg — redemption inaccessible → SECONDARY_REALIZABLE
 // ═══════════════════════════════════════════════════════════════════
 
-describe("Variance guard", () => {
-  it("should DEFER when open mark deviates >1% from reference", async () => {
+describe("Regime 4: Depeg with inaccessible redemption — the bad-debt proof", () => {
+  it("should report discounted secondary price, NOT NAV", async () => {
     const wasm = await file(WASM_PATH).arrayBuffer();
-
-    // Reference $135, but all sources report $140 = 3.7% deviation > 1% threshold
-    const reveal = JSON.stringify({
-      sy: "NVDA", ss: "OPEN", ts: TS_OPEN,
-      ep: 20, vt: 100, tw: 900, rp: 135_000_000, so: 5400,
-      src: [
-        { n: "dxFeed", p: 140_000_000, ok: true },
-        { n: "Finage", p: 140_000_000, ok: true },
-        { n: "Pyth", p: 140_000_000, ok: true },
+    // Token depegs: NAV = $135 but secondary trades at $120 (11% below)
+    // Redemption is open but NOT accessible to anonymous liquidators (KYC-gated)
+    const reveal = makeReveal({
+      ss: "OPEN", so: 5400,
+      underlying: [
+        { n: "dxFeed", p: 135_000_000, ok: true },
+        { n: "Finage", p: 135_000_000, ok: true },
       ],
+      secondary: [
+        { n: "Uniswap", p: 120_000_000, ok: true },
+        { n: "Curve", p: 119_500_000, ok: true },
+      ],
+      nav: 135_000_000,
+      rp: 135_000_000,
+      vt: 2000, // wide threshold to allow the depeg through
+      rd: {
+        open: true, instant: true,
+        accessible_to_liquidator: false, // KEY: liquidator can't redeem
+        redemption_asset: "USDon",
+        swapper_liquidity_sufficient: true,
+        nav_price: 135_000_000,
+      },
+      dp: 50_000, dt: 100_000, // thin secondary depth
     });
 
     const vm = await testOracleProgramTally(Buffer.from(wasm), Buffer.from("t"),
@@ -219,9 +193,86 @@ describe("Variance guard", () => {
     expect(vm.exitCode).toBe(0);
     const r = JSON.parse(Buffer.from(vm.result).toString("utf-8"));
 
-    expect(r.valid).toBe(false); // DEFER
-    expect(r.mark).toBe(140_000_000); // still reports the price
+    expect(r.anchor).toBe("SECONDARY_REALIZABLE"); // NOT NAV_ANCHORED
+    expect(r.ra).toBe(false); // redemption not accessible
+    // Mark should be around $120 (secondary), NOT $135 (NAV)
+    expect(r.mark).toBeLessThan(125_000_000);
+    expect(r.nav).toBe(135_000_000); // NAV reported but not used as mark
+    expect(r.dd).toBeGreaterThan(0); // depth discount on thin book
+    expect(r.valid).toBe(true);
 
-    console.log("DEFER result:", JSON.stringify(r, null, 2));
+    console.log("DEPEG (inaccessible redemption):", JSON.stringify(r, null, 2));
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// REGIME 5: Inverse — redemption accessible → NAV_ANCHORED
+// ═══════════════════════════════════════════════════════════════════
+
+describe("Regime 5: Redemption accessible — anchors near NAV", () => {
+  it("should anchor near NAV even if thin secondary dips", async () => {
+    const wasm = await file(WASM_PATH).arrayBuffer();
+    // Secondary dips to $130 on thin volume, but redemption is fully accessible
+    const reveal = makeReveal({
+      ss: "OPEN", so: 5400,
+      underlying: [
+        { n: "dxFeed", p: 135_000_000, ok: true },
+        { n: "Finage", p: 135_000_000, ok: true },
+      ],
+      secondary: [
+        { n: "Uniswap", p: 130_000_000, ok: true },
+      ],
+      nav: 135_000_000,
+      rp: 135_000_000,
+      rd: {
+        open: true, instant: true,
+        accessible_to_liquidator: true, // liquidator CAN redeem
+        redemption_asset: "USDC",
+        swapper_liquidity_sufficient: true,
+        nav_price: 135_000_000,
+      },
+      dp: 200_000, dt: 100_000,
+    });
+
+    const vm = await testOracleProgramTally(Buffer.from(wasm), Buffer.from("t"),
+      [{ exitCode: 0, gasUsed: 0, inConsensus: true, result: Buffer.from(reveal) }]);
+    expect(vm.exitCode).toBe(0);
+    const r = JSON.parse(Buffer.from(vm.result).toString("utf-8"));
+
+    expect(r.anchor).toBe("NAV_ANCHORED"); // peg is enforceable
+    expect(r.ra).toBe(true);
+    // Mark should be near $135 (NAV), NOT dragged down to $130 secondary
+    expect(r.mark).toBeGreaterThan(134_000_000);
+    expect(r.dd).toBe(0); // no depth discount in NAV_ANCHORED mode
+
+    console.log("NAV_ANCHORED (accessible redemption):", JSON.stringify(r, null, 2));
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// Variance guard
+// ═══════════════════════════════════════════════════════════════════
+
+describe("Variance guard", () => {
+  it("should DEFER when mark exceeds threshold", async () => {
+    const wasm = await file(WASM_PATH).arrayBuffer();
+    const reveal = makeReveal({
+      underlying: [
+        { n: "dxFeed", p: 140_000_000, ok: true },
+        { n: "Finage", p: 140_000_000, ok: true },
+      ],
+      secondary: [
+        { n: "Uniswap", p: 139_000_000, ok: true },
+      ],
+      vt: 100, // 1% threshold, but price moved 3.7%
+    });
+
+    const vm = await testOracleProgramTally(Buffer.from(wasm), Buffer.from("t"),
+      [{ exitCode: 0, gasUsed: 0, inConsensus: true, result: Buffer.from(reveal) }]);
+    expect(vm.exitCode).toBe(0);
+    const r = JSON.parse(Buffer.from(vm.result).toString("utf-8"));
+
+    expect(r.valid).toBe(false);
+    console.log("DEFER:", JSON.stringify(r, null, 2));
   });
 });

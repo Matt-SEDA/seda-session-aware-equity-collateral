@@ -1,113 +1,140 @@
 # SEDA Session-Aware Equity Collateral Oracle
 
-Continuous 24/7 mark price for tokenized equities used as lending collateral — including weekends and holidays when the underlying market is closed. Multi-source median in-session, self-referential EMA off-hours, smooth transition at reopening.
+Continuous 24/7 **realizable** collateral value for tokenized equities — not just a reference price, but what a liquidator can actually sell for right now. Triangulates three price signals (underlying, secondary market, NAV), applies redemption-policy awareness, depth discount, and session-state logic.
 
-**Testnet Oracle Program ID:** `c00f2bd15724ca9a518f482ed82ffcf6cba4ebbc3029220adf037baa49960371`
+**Testnet Oracle Program ID:** `20f52da7a3d6514ce2f6b76cb9138e607625e01237b04fe108730821047f0107`
 
 ## The Problem
 
-Tokenized equities (NVDA, TSLA, AAPL) trade 24/7 onchain, but the underlying equity market is open ~6.5 hours/day, 5 days/week. Lending protocols using these as collateral need a mark price that:
+A tokenized stock (e.g. Ondo's tokenized NVDA) has three prices that diverge in stress:
 
-1. **Never freezes** — a stale price during off-hours means liquidations can't fire when needed
-2. **Resists manipulation** — thin off-hours liquidity makes it trivial to spike the price and drain a lending pool
-3. **Doesn't gap** — a 15% Monday-morning jump in one block triggers a cascade of simultaneous liquidations
+1. **Underlying** — the real equity price. Trades ~6.5 hours/day, 5 days/week.
+2. **Token secondary market** — what the token trades for onchain. Trades 24/7 but thin off-hours.
+3. **NAV / redemption** — the issuer's mint/redeem price. Looks like the "right" answer, but redemption is typically KYC-gated, which means an anonymous liquidator on a permissionless lending market **cannot access it**.
 
-This oracle solves all three.
+If a lending protocol uses NAV as collateral value when redemption is inaccessible, and the secondary market depegs, the protocol accumulates bad debt — the price it reports is higher than what any liquidator can actually recover.
 
-## How It Works
+## How This Oracle Solves It
 
-### Three Regimes
+### Three-signal triangulation
 
-**In-session (OPEN):** Multi-source median (dxFeed, Finage, Pyth) with MAD outlier rejection. One wick or one manipulated venue can't move the mark.
+The oracle carries all three price signals through and doesn't collapse them early:
 
-**Off-hours (CLOSED/PRE/POST):** Self-referential EMA seeded from the last in-session mark, updated by whatever signals are still moving (onchain venue price, crypto proxy). With EMA period 20, alpha = 0.095 — a $7 spike on a thin off-hours venue only moves the mark by ~$0.67. Manipulation-resistant by construction.
+| Signal | Source | When available |
+|--------|--------|----------------|
+| Underlying reference | dxFeed, Finage | In-session only |
+| Tokenized secondary | Onchain venue prices (config input) | 24/7 |
+| NAV / redemption | Issuer data (config input) | When reported |
 
-**Transition (just-opened window):** Cubic-eased interpolation from the off-hours mark to the live composite over a configurable window (default 15 minutes). The mark walks smoothly to the new level instead of jumping in one block — no reopening-gap liquidation cascade.
+### Anchor mode — NAV vs secondary
 
-### Variance Guard
+The oracle determines whether NAV is trustworthy as collateral value based on redemption policy:
 
-If the computed mark deviates beyond the configured threshold (default 1%) from the last known reference, the oracle flags `valid: false` (DEFER) rather than emitting a suspect price. The lending protocol can hold the previous mark instead of acting on bad data.
+| Condition | Anchor mode | Mark computation |
+|-----------|-------------|-----------------|
+| Redemption open + instant + accessible to liquidator + swapper liquid | **NAV_ANCHORED** | Mark near NAV (peg is enforceable) |
+| Any condition fails | **SECONDARY_REALIZABLE** | Mark = conservative estimate from secondary market |
+
+### Off-hours composite (not EMA)
+
+Off-hours the underlying is dark. The mark is a reference-anchored **weighted composite** of still-moving signals (secondary venues + crypto proxy), where the reference gets weight = period and each live signal gets weight = 1. Higher period = more anchored to reference = more manipulation-resistant. Stateless — same inputs always produce the same output (required for consensus).
+
+### Depth / liquidity awareness
+
+The mark is capped by what the secondary book can absorb. Thin depth → discounted mark + widened confidence. A top-of-book price on a $15K book is not the same collateral value as a $500K book.
+
+### Session-state logic
+
+- **OPEN:** Multi-source median with MAD outlier rejection
+- **CLOSED / PRE / POST:** Reference-anchored composite from secondary + crypto proxy
+- **TRANSITION:** Cubic-eased interpolation from off-hours composite to live, over configurable window (default 15 min)
+- **Variance guard:** DEFER if mark deviates beyond threshold from reference
 
 ## Sample Outputs
 
-### Regime 1: In-session — mark tracks live median
+### Regime 1: In-session — SECONDARY_REALIZABLE
 
-**Request:**
+Redemption inaccessible to liquidators (default). Mark = min(underlying, secondary) = conservative realizable value.
+
 ```json
 {
-  "symbol": "NVDA",
-  "timestamp": 1751310000,
-  "config": { "last_reference_price": 135000000 }
+  "mark": 134850000, "mf": "134.85",
+  "anchor": "SECONDARY_REALIZABLE", "ss": "OPEN",
+  "valid": true, "conf": 95, "ra": false,
+  "ul": 135000000, "sec": 134850000, "nav": 135000000,
+  "dd": 0, "su": 5
 }
 ```
 
-**Response:**
+### Regime 2: Weekend — manipulation resistance
+
+Off-hours signals spike to $142 (5% above $135 reference). Composite with period=20 barely moves the pre-discount mark (~$135.62). Depth discount applied on thin $15K book (425bps).
+
 ```json
 {
-  "mark": 135000000,
-  "mf": "135.00",
-  "ss": "OPEN",
-  "valid": true,
-  "conf": 95,
-  "su": 3,
-  "sn": ["dxFeed", "Finage", "Pyth"],
-  "sy": "NVDA"
+  "mark": 129852233, "mf": "129.85",
+  "anchor": "SECONDARY_REALIZABLE", "ss": "CLOSED_WEEKEND",
+  "valid": true, "conf": 43, "ra": false,
+  "ul": 0, "sec": 141750000, "nav": 135000000,
+  "dd": 425, "su": 3
 }
 ```
-
-### Regime 2: Weekend — manipulation-resistant continuous mark
-
-**Request:** Same symbol, Saturday timestamp. Off-hours signal spikes to $142 (5% above $135 reference).
-
-**Response:**
-```json
-{
-  "mark": 135666667,
-  "mf": "135.67",
-  "ss": "CLOSED_WEEKEND",
-  "valid": true,
-  "conf": 60,
-  "su": 1,
-  "sn": ["Pyth"],
-  "sy": "NVDA"
-}
-```
-
-The $7 spike moved the mark by only $0.67. A thin off-hours print cannot move the collateral mark materially.
 
 ### Regime 3: Monday open with 15% gap — smooth transition
 
-**Request:** Monday, 5 minutes after open. Live sources report $155 (15% gap up from $135 reference).
+Live sources report $155. Mark walks smoothly from off-hours composite toward live level. No single-block jump.
 
-**Response (5 min in, 33% through window):**
 ```json
 {
-  "mark": 137837945,
-  "mf": "137.84",
-  "ss": "TRANSITION",
-  "valid": true,
-  "conf": 71,
-  "su": 3,
-  "sn": ["dxFeed", "Finage", "Pyth"],
-  "sy": "NVDA"
+  "mark": 139509175, "mf": "139.51",
+  "anchor": "SECONDARY_REALIZABLE", "ss": "TRANSITION",
+  "valid": true, "conf": 72, "ra": false,
+  "ul": 155100000, "sec": 154650000, "nav": 135000000,
+  "dd": 0, "su": 5
 }
 ```
 
-**Response (14 min in, 94% through window):**
+### Regime 4: Depeg with inaccessible redemption — the bad-debt proof
+
+Token depegs: NAV = $135 but secondary trades at $120. Redemption is open but KYC-gated — a permissionless liquidator **cannot redeem at NAV**. The oracle reports the secondary realizable value ($116.76 after depth discount), not NAV.
+
 ```json
 {
-  "mark": 154809523,
-  "mf": "154.81",
-  "ss": "TRANSITION",
-  "valid": true,
-  "conf": 93,
-  "su": 3,
-  "sn": ["dxFeed", "Finage", "Pyth"],
-  "sy": "NVDA"
+  "mark": 116756250, "mf": "116.76",
+  "anchor": "SECONDARY_REALIZABLE", "ss": "OPEN",
+  "valid": true, "conf": 85, "ra": false,
+  "ul": 135000000, "sec": 119750000, "nav": 135000000,
+  "dd": 250, "su": 5
 }
 ```
 
-No single-block jump from $135 to $155. The mark walks there smoothly over 15 minutes using cubic easing.
+**This is the critical case.** A naive oracle reporting NAV ($135) would tell the lending protocol the collateral is fine. This oracle reports $116.76 — what a liquidator can actually recover. That $18.24 difference is the bad debt the protocol avoids.
+
+### Regime 5: Redemption accessible — NAV_ANCHORED
+
+Redemption open + instant + accessible to liquidators + swapper liquid. Secondary dips to $130 on thin volume, but the peg is enforceable — mark anchors at NAV.
+
+```json
+{
+  "mark": 135000000, "mf": "135.00",
+  "anchor": "NAV_ANCHORED", "ss": "OPEN",
+  "valid": true, "conf": 95, "ra": true,
+  "ul": 135000000, "sec": 130000000, "nav": 135000000,
+  "dd": 0, "su": 4
+}
+```
+
+### Variance guard — DEFER
+
+Mark deviates >1% from reference. Oracle flags `valid: false` rather than emitting suspect data.
+
+```json
+{
+  "mark": 139000000, "mf": "139.00",
+  "anchor": "SECONDARY_REALIZABLE", "ss": "OPEN",
+  "valid": false, "conf": 85, "ra": false, "dd": 0
+}
+```
 
 ## Input Parameters
 
@@ -119,49 +146,57 @@ No single-block jump from $135 to $155. The mark walks there smoothly over 15 mi
     "open_hour": 13, "open_min": 30,
     "close_hour": 20, "close_min": 0,
     "trading_days": [1, 2, 3, 4, 5],
-    "holidays": ["2026-07-04", "2026-12-25"],
+    "holidays": ["2026-07-04"],
     "ema_period": 20,
     "variance_threshold_bps": 100,
     "transition_secs": 900,
     "last_reference_price": 135000000,
     "pyth_feed_id": "0x..."
+  },
+  "redemption": {
+    "open": true,
+    "instant": true,
+    "accessible_to_liquidator": false,
+    "redemption_asset": "USDC",
+    "swapper_liquidity_sufficient": true,
+    "nav_price": 135000000
+  },
+  "secondary": {
+    "venue_prices": [134800000, 134900000],
+    "venue_names": ["Uniswap", "Curve"],
+    "depth_usd": 200000,
+    "depth_threshold_usd": 100000
   }
 }
 ```
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `symbol` | — | Equity ticker (NVDA, TSLA, AAPL) |
-| `timestamp` | — | Reference time (unix secs) — the program's deterministic clock |
-| `open_hour/min` | 13:30 UTC | NYSE open |
-| `close_hour/min` | 20:00 UTC | NYSE close |
-| `trading_days` | Mon–Fri | ISO weekday numbers |
-| `holidays` | [] | Dates as "YYYY-MM-DD" |
-| `ema_period` | 20 | Off-hours EMA period (higher = more manipulation-resistant) |
-| `variance_threshold_bps` | 100 | Max deviation from reference before DEFER (100 = 1%) |
-| `transition_secs` | 900 | Reopening interpolation window (900 = 15 min) |
-| `last_reference_price` | 0 | Last known in-session mark (micro-cents) for EMA seed |
-| `pyth_feed_id` | "" | Optional Pyth Hermes feed ID |
+| Section | Key fields |
+|---------|------------|
+| **config** | Session calendar, anchor period (higher = more manipulation-resistant), variance guard, transition window |
+| **redemption** | Policy state: `accessible_to_liquidator` governs NAV_ANCHORED vs SECONDARY_REALIZABLE |
+| **secondary** | Onchain venue prices + order book depth for realizable value computation |
 
 No secrets in inputs — all data sources use public endpoints.
 
-## Data Sources
+## Output Fields
 
-| Source | Data | Auth |
-|--------|------|------|
-| **dxFeed** | Equity quotes (bid/ask mid) | Public (15-min delayed on demo) |
-| **Finage** | Real-time equity data | Public (demo key) |
-| **Pyth Hermes** | Equity/crypto prices | Public (no auth) |
-
-Never Binance, CoinGecko, or CoinMarketCap.
+| Field | Description |
+|-------|-------------|
+| `mark` | **Realizable collateral value** (micro-cents) |
+| `anchor` | `NAV_ANCHORED` or `SECONDARY_REALIZABLE` |
+| `valid` | `true` = safe to use, `false` = DEFER |
+| `conf` | Confidence 0–100 |
+| `ra` | Redemption accessible to liquidator? |
+| `ul` / `sec` / `nav` | The three raw signal prices |
+| `dd` | Depth discount applied (basis points) |
 
 ## Build & Test
 
 ```bash
 bun install
 make build
-bun test tests/    # 6 tests: open session, weekend manipulation resistance,
-                   # transition early/late, variance guard DEFER
+bun test tests/    # 6 tests: in-session, weekend manipulation, transition gap,
+                   # depeg-inaccessible (bad-debt proof), NAV-anchored, variance guard
 ```
 
 ## Architecture
@@ -169,10 +204,10 @@ bun test tests/    # 6 tests: open session, weekend manipulation resistance,
 ```
 src/
   main.rs              — SEDA oracle program entry point
-  execution_phase.rs   — Multi-source fetch + deterministic session detection
-  tally_phase.rs       — Median/EMA/transition/variance-guard computation
+  execution_phase.rs   — Three-signal fetch + session detection + redemption state
+  tally_phase.rs       — Triangulation, anchor mode, composite, depth discount, guards
 tests/
-  index.test.ts        — 6 tests across all three regimes
+  index.test.ts        — 6 tests across all regimes including depeg proof
 ```
 
 Built on [SEDA](https://seda.xyz) — custom oracle logic, any data, one endpoint.
